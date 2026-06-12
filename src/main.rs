@@ -20,6 +20,7 @@ fn main() {
         .build();
 
     let runtime = app::AppRuntime::new();
+    runtime.install_signal_handlers();
     application.connect_command_line(move |application, command_line| {
         let args = command_line.arguments();
         runtime.handle_command_line(application, &args)

@@ -111,6 +111,14 @@ target/release/cliphist-ui --service
 
 In service mode, the primary GTK application stays alive without presenting the popup. Later `cliphist-ui` invocations are routed to the running primary instance and toggle the existing popup. Closing, quitting, or copying hides the popup instead of destroying the process.
 
+Reload the resident service config and CSS without killing the app:
+
+```sh
+pkill -SIGUSR1 cliphist-ui
+```
+
+This re-reads `config.json5`, `style.css`, and any CSS files imported by `style.css` in the running `--service` process.
+
 ## Keyboard
 
 The app starts in normal/list mode unless `behavior.start_in_insert` is enabled.

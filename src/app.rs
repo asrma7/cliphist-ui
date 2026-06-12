@@ -4,25 +4,59 @@ use crate::{
 };
 use async_channel::Sender;
 use gtk::{gdk, gio, glib, prelude::*};
+use signal_hook::consts::SIGUSR1;
 use std::{
     cell::{Cell, RefCell},
     collections::{HashMap, HashSet},
     ffi::{OsStr, OsString},
     path::PathBuf,
     rc::Rc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     thread,
     time::Duration,
 };
+use tracing::{info, warn};
 
 #[derive(Clone, Default)]
 pub struct AppRuntime {
     state: Rc<RefCell<Option<Rc<RefCell<AppState>>>>>,
     service_hold: Rc<RefCell<Option<gio::ApplicationHoldGuard>>>,
+    reload_config_requested: Arc<AtomicBool>,
+    signal_poll_installed: Rc<Cell<bool>>,
 }
 
 impl AppRuntime {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn install_signal_handlers(&self) {
+        if self.signal_poll_installed.get() {
+            return;
+        }
+
+        if let Err(err) =
+            signal_hook::flag::register(SIGUSR1, Arc::clone(&self.reload_config_requested))
+        {
+            warn!(error = %err, "failed to install SIGUSR1 config reload handler");
+            return;
+        }
+
+        self.signal_poll_installed.set(true);
+        let runtime = self.clone();
+        glib::timeout_add_local(Duration::from_millis(200), move || {
+            if runtime
+                .reload_config_requested
+                .swap(false, Ordering::AcqRel)
+            {
+                runtime.reload_config_from_signal();
+            }
+
+            glib::ControlFlow::Continue
+        });
     }
 
     pub fn handle_command_line(
@@ -58,6 +92,19 @@ impl AppRuntime {
         *self.service_hold.borrow_mut() = Some(application.hold());
     }
 
+    fn reload_config_from_signal(&self) {
+        let Some(state) = self.state.borrow().as_ref().cloned() else {
+            return;
+        };
+
+        let mut state = state.borrow_mut();
+        if state.service_mode {
+            state.reload_config();
+        } else {
+            warn!("received SIGUSR1 outside service mode; ignoring config reload");
+        }
+    }
+
     fn ensure_state(&self, application: &gtk::Application) -> Rc<RefCell<AppState>> {
         if let Some(state) = self.state.borrow().as_ref() {
             return Rc::clone(state);
@@ -70,6 +117,7 @@ impl AppRuntime {
             config.image.clone(),
             thumbnail_cache_dir.clone(),
             sender.clone(),
+            0,
         );
         let ui = Ui::new(application, &config);
         let suppress_selection = Rc::new(Cell::new(false));
@@ -133,10 +181,12 @@ pub enum AppEvent {
         generation: u64,
     },
     ThumbnailReady {
+        generation: u64,
         id: String,
         path: PathBuf,
     },
     ThumbnailFailed {
+        generation: u64,
         id: String,
         error: String,
     },
@@ -152,6 +202,7 @@ struct AppState {
     visible: Vec<usize>,
     selected: usize,
     reload_generation: u64,
+    thumbnail_generation: u64,
     thumbnails: HashMap<String, PathBuf>,
     requested_thumbnails: HashSet<String>,
     failed_thumbnails: HashSet<String>,
@@ -190,6 +241,7 @@ impl AppState {
             visible: Vec::new(),
             selected: 0,
             reload_generation: 0,
+            thumbnail_generation: 0,
             thumbnails: HashMap::new(),
             requested_thumbnails: HashSet::new(),
             failed_thumbnails: HashSet::new(),
@@ -304,7 +356,15 @@ impl AppState {
                     self.set_default_status();
                 }
             }
-            AppEvent::ThumbnailReady { id, path } => {
+            AppEvent::ThumbnailReady {
+                generation,
+                id,
+                path,
+            } => {
+                if generation != self.thumbnail_generation {
+                    return;
+                }
+
                 self.requested_thumbnails.remove(&id);
                 self.failed_thumbnails.remove(&id);
                 self.thumbnails.insert(id.clone(), path);
@@ -312,7 +372,15 @@ impl AppState {
                     self.render_visible();
                 }
             }
-            AppEvent::ThumbnailFailed { id, error } => {
+            AppEvent::ThumbnailFailed {
+                generation,
+                id,
+                error,
+            } => {
+                if generation != self.thumbnail_generation {
+                    return;
+                }
+
                 self.requested_thumbnails.remove(&id);
                 self.failed_thumbnails.insert(id.clone());
                 if self.selected_item().is_some_and(|item| item.id == id) {
@@ -415,6 +483,63 @@ impl AppState {
 
     fn reload_silent(&mut self) {
         self.reload_with_status(false);
+    }
+
+    fn reload_config(&mut self) {
+        let old_config = self.config.clone();
+        let new_config = config::load();
+        let new_cache_dir = config::cache_dir();
+        let reparse_items = old_config.list != new_config.list;
+        let reload_thumbnails =
+            old_config.image != new_config.image || self.thumbnail_cache_dir != new_cache_dir;
+        let restart_loading = self.loading;
+
+        self.config = new_config;
+        self.pending_clear = false;
+        self.show_keybind_help = false;
+
+        self.ui.reload_css();
+        self.ui.apply_config(&self.config);
+
+        if reparse_items {
+            self.reparse_items();
+        }
+
+        if reload_thumbnails {
+            self.reload_thumbnailer(new_cache_dir);
+        }
+
+        if restart_loading {
+            self.reload_silent();
+        }
+
+        self.refresh_filter(false, false);
+        self.set_temporary_status("Configuration reloaded", Duration::from_millis(1200));
+        info!("configuration reloaded from SIGUSR1");
+    }
+
+    fn reparse_items(&mut self) {
+        self.items = self
+            .items
+            .iter()
+            .filter_map(|item| {
+                ClipboardItem::parse(&item.raw_line, self.config.list.max_text_chars)
+            })
+            .collect();
+    }
+
+    fn reload_thumbnailer(&mut self, cache_dir: PathBuf) {
+        self.thumbnail_generation = self.thumbnail_generation.wrapping_add(1);
+        self.thumbnail_cache_dir = cache_dir;
+        self.thumbnailer = Thumbnailer::new(
+            self.config.image.clone(),
+            self.thumbnail_cache_dir.clone(),
+            self.sender.clone(),
+            self.thumbnail_generation,
+        );
+        self.thumbnails.clear();
+        self.requested_thumbnails.clear();
+        self.failed_thumbnails.clear();
     }
 
     fn reload_with_status(&mut self, update_status: bool) {

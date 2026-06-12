@@ -27,7 +27,12 @@ struct ThumbnailJob {
 }
 
 impl Thumbnailer {
-    pub fn new(config: ImageConfig, cache_dir: PathBuf, event_sender: Sender<AppEvent>) -> Self {
+    pub fn new(
+        config: ImageConfig,
+        cache_dir: PathBuf,
+        event_sender: Sender<AppEvent>,
+        generation: u64,
+    ) -> Self {
         let (sender, receiver) = async_channel::bounded::<ThumbnailJob>(128);
         let workers = config.concurrent_jobs.clamp(1, 8);
 
@@ -38,7 +43,14 @@ impl Thumbnailer {
             let cache_dir = cache_dir.clone();
 
             thread::spawn(move || {
-                worker_loop(worker_id, receiver, event_sender, config, cache_dir);
+                worker_loop(
+                    worker_id,
+                    receiver,
+                    event_sender,
+                    config,
+                    cache_dir,
+                    generation,
+                );
             });
         }
 
@@ -61,16 +73,22 @@ fn worker_loop(
     event_sender: Sender<AppEvent>,
     config: ImageConfig,
     cache_dir: PathBuf,
+    generation: u64,
 ) {
     while let Ok(job) = receiver.recv_blocking() {
         debug!(worker_id, id = %job.id, "thumbnail job started");
         match thumbnail_path(&job, &config, &cache_dir) {
             Ok(path) => {
-                let _ = event_sender.send_blocking(AppEvent::ThumbnailReady { id: job.id, path });
+                let _ = event_sender.send_blocking(AppEvent::ThumbnailReady {
+                    generation,
+                    id: job.id,
+                    path,
+                });
             }
             Err(err) => {
                 warn!(worker_id, id = %job.id, error = %err, "thumbnail job failed");
                 let _ = event_sender.send_blocking(AppEvent::ThumbnailFailed {
+                    generation,
                     id: job.id,
                     error: format!("{err:#}"),
                 });
